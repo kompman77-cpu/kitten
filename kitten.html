@@ -1,0 +1,2020 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#6EC6FF">
+<title>Котик в Облаках</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%;
+    overflow:hidden;
+    background:#6EC6FF;
+    touch-action:none;
+    overscroll-behavior:none;
+    -webkit-user-select:none; user-select:none;
+    -webkit-tap-highlight-color:transparent;
+    position:fixed;
+    inset:0;
+  }
+  #game {
+    display:block;
+    width:100%;
+    height:100%;
+  }
+  /* Кнопка Unmute для iOS — скрыта, пока не понадобится */
+  #unmuteBtn {
+    position:fixed;
+    bottom:20px;
+    left:50%;
+    transform:translateX(-50%);
+    padding:12px 24px;
+    background:rgba(0,0,0,0.7);
+    color:#fff;
+    font:bold 16px monospace;
+    border:2px solid #fff;
+    border-radius:12px;
+    z-index:100;
+    display:none;
+    cursor:pointer;
+    -webkit-tap-highlight-color:transparent;
+  }
+  #unmuteBtn.show { display:block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="unmuteBtn">🔊 Включить звук</button>
+<script>
+(() => {
+"use strict";
+
+/* ============ ЧАСТЬ 1: каркас, ввод, игровой цикл ============ */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+const unmuteBtn = document.getElementById('unmuteBtn');
+const TAU = Math.PI * 2;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp  = (a, b, t) => a + (b - a) * t;
+
+let W = 0, H = 0, K = 1, DPR = 1;
+
+const STATE = { MENU: 0, PLAY: 1, OVER: 2 };
+let state = STATE.MENU;
+
+let player = null, platforms = [], stars = [], birds = [], particles = [];
+let cameraY = 0, cameraTargetY = 0, topY = 0, score = 0, starsCount = 0;
+let elapsed = 0, overTime = 0, shake = 0, record = false;
+let lives = 3, flash = 0;
+let menuBlink = 3;
+let best = +(localStorage.getItem('kittyBest') || 0);
+
+// Комбо
+let combo = 0, comboT = 0, comboMax = 0;
+
+// Новые облака: пружинные и исчезающие
+let springCount = 0;
+
+// UI-анимации
+let uiTexts = []; // {x, y, text, color, life, max, vy, scale}
+
+// Камера: zoom-пульс
+let zoomPulse = 0;
+
+let touchX = null, touchActive = false;
+let muteBtn = null;
+
+// ---------- RESIZE ----------
+function getViewport() {
+  const vv = window.visualViewport;
+  if (vv) return { w: vv.width, h: vv.height };
+  return { w: window.innerWidth, h: window.innerHeight };
+}
+
+function resize() {
+  const vp = getViewport();
+  W = Math.max(1, Math.round(vp.w));
+  H = Math.max(1, Math.round(vp.h));
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  K = clamp(Math.min(W / 420, H / 800) * 1.1, 0.6, 2.2);
+  initParallax();
+  buildCloudCache();
+}
+
+let fsTried = false;
+function tryFullscreen() {
+  if (fsTried) return;
+  fsTried = true;
+  const el = document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+}
+
+function inMute(x, y) {
+  return !!muteBtn && x >= muteBtn.x && x <= muteBtn.x + muteBtn.w &&
+         y >= muteBtn.y && y <= muteBtn.y + muteBtn.h;
+}
+
+// ---------- INPUT ----------
+window.addEventListener('pointerdown', e => {
+  unlockAudio();
+  tryFullscreen();
+  if (inMute(e.clientX, e.clientY)) {
+    muted = !muted;
+    if (musicGain) musicGain.gain.value = muted ? 0 : 0.55;
+    return;
+  }
+  touchX = e.clientX;
+  touchActive = true;
+  if (state === STATE.MENU) startGame();
+  else if (state === STATE.OVER && elapsed - overTime > 0.7) startGame();
+}, { passive: true });
+
+window.addEventListener('pointermove', e => {
+  if (touchActive || e.pointerType === 'mouse') touchX = e.clientX;
+});
+window.addEventListener('pointerup',     () => { touchActive = false; touchX = null; });
+window.addEventListener('pointercancel', () => { touchActive = false; touchX = null; });
+
+// Fallback для старых iOS
+if (!window.PointerEvent) {
+  window.addEventListener('touchstart', e => {
+    unlockAudio(); tryFullscreen();
+    const t = e.changedTouches[0];
+    touchX = t.clientX; touchActive = true;
+    if (state === STATE.MENU) startGame();
+    else if (state === STATE.OVER && elapsed - overTime > 0.7) startGame();
+  }, { passive: true });
+  window.addEventListener('touchmove', e => {
+    const t = e.changedTouches[0];
+    touchX = t.clientX;
+  }, { passive: true });
+  window.addEventListener('touchend', () => { touchActive = false; touchX = null; }, { passive: true });
+}
+
+window.addEventListener('resize', resize);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 150));
+
+// ---------- GAME LOOP ----------
+let last = performance.now();
+let gameTime = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  gameTime += dt;
+
+  if (state === STATE.PLAY) update(dt);
+  else updateIdle(dt);
+
+  // Плавная камера с упреждением
+  const aheadOffset = player && state === STATE.PLAY ? clamp(player.vy * 0.08, -60, 60) : 0;
+  cameraTargetY = cameraY + aheadOffset * 0.3;
+  cameraY = lerp(cameraY, cameraTargetY, Math.min(1, dt * 8));
+  zoomPulse = Math.max(0, zoomPulse - dt * 4);
+
+  draw(dt);
+}
+
+/* ---------- ИНИЦИАЛИЗАЦИЯ ПАРАЛЛАКСА ---------- */
+let bgClouds = [], bgStars = [], fallingStars = [];
+
+function initParallax() {
+  bgClouds = [];
+  for (let i = 0; i < 7; i++)
+    bgClouds.push({ x: Math.random(), y: Math.random() * 1.6, s: rand(0.35, 0.55),
+                    sp: rand(3, 7), par: 0.035, a: 0.32, ti: 4 });
+  for (let i = 0; i < 5; i++)
+    bgClouds.push({ x: Math.random(), y: Math.random() * 1.6, s: rand(0.55, 0.8),
+                    sp: rand(6, 13), par: 0.07, a: 0.48, ti: 4 });
+  bgStars = [];
+  for (let i = 0; i < 70; i++)
+    bgStars.push({ x: Math.random(), y: Math.random(), r: rand(0.8, 2.4), tw: rand(0, 6) });
+  fallingStars = [];
+}
+
+/* ---------- КЭШ ОБЛАКОВ (offscreen) ---------- */
+const CLOUD_TINTS = [
+  ['#FFFFFF', '#CBE6FA'],
+  ['#FFFFFF', '#BFE0D6'],
+  ['#FFF6EA', '#F6D8BE'],
+  ['#FFF2F7', '#E9C4E6'],
+  ['#EAF7FF', '#AECBEC'],
+  ['#FFE9A8', '#FFC94D']
+];
+const CLOUD_CACHE = {}; // key -> canvas
+const CLOUD_SIZE = 140;
+
+function buildCloudCache() {
+  for (let ti = 0; ti < 6; ti++) {
+    for (const type of ['normal', 'break', 'moving']) {
+      const key = type + '_' + ti;
+      if (CLOUD_CACHE[key]) continue;
+      const c = document.createElement('canvas');
+      c.width = CLOUD_SIZE;
+      c.height = CLOUD_SIZE;
+      const p = c.getContext('2d');
+      drawCloudToCanvas(p, CLOUD_SIZE / 2, CLOUD_SIZE / 2, 1, type, ti);
+      CLOUD_CACHE[key] = c;
+    }
+  }
+}
+
+function drawCloudToCanvas(p, x, y, s, type, ti) {
+  let hi, lo;
+  if (type === 'break')       { hi = '#F5F8FB'; lo = '#A9B8C6'; }
+  else if (type === 'moving') { hi = '#FFFFFF'; lo = '#B8DFF6'; }
+  else {
+    const t = CLOUD_TINTS[ti || 0];
+    hi = t[0]; lo = t[1];
+  }
+
+  p.fillStyle = 'rgba(120, 160, 205, 0.35)';
+  cloudBodyTo(p, x, y + 5 * s, s);
+
+  const g = p.createLinearGradient(0, y - 28 * s, 0, y + 24 * s);
+  g.addColorStop(0, hi);
+  g.addColorStop(0.65, hi);
+  g.addColorStop(1, lo);
+  cloudBodyTo(p, x, y, s);
+  p.fillStyle = g;
+  p.fill();
+
+  p.fillStyle = 'rgba(255, 255, 255, 0.9)';
+  p.beginPath();
+  p.arc(x - 11 * s, y - 11 * s, 6.5 * s, 0, TAU);
+  p.moveTo(x + 13 * s, y - 16 * s);
+  p.arc(x + 7 * s, y - 16 * s, 5 * s, 0, TAU);
+  p.moveTo(x + 21 * s, y - 7 * s);
+  p.arc(x + 17 * s, y - 7 * s, 4 * s, 0, TAU);
+  p.fill();
+
+  p.fillStyle = 'rgba(130, 170, 215, 0.25)';
+  p.beginPath();
+  p.ellipse(x, y + 12 * s, 27 * s, 8 * s, 0, 0, Math.PI);
+  p.fill();
+}
+
+function cloudBodyTo(p, x, y, s) {
+  p.beginPath();
+  const lobes = [
+    [0, 0, 22], [-25, 7, 16], [25, 5, 18], [8, -14, 15], [-13, -9, 13]
+  ];
+  for (const L of lobes) {
+    p.moveTo(x + L[0] * s + L[2] * s, y + L[1] * s);
+    p.arc(x + L[0] * s, y + L[1] * s, L[2] * s, 0, TAU);
+  }
+  p.closePath();
+}
+
+/* ---------- ПЛАВНОЕ ПОЯВЛЕНИЕ UI ---------- */
+let menuAppear = 0, overAppear = 0;
+
+function updateUIPhase(dt) {
+  if (state === STATE.MENU) menuAppear = Math.min(1, menuAppear + dt * 3);
+  else menuAppear = Math.max(0, menuAppear - dt * 5);
+  if (state === STATE.OVER) overAppear = Math.min(1, overAppear + dt * 3);
+  else overAppear = Math.max(0, overAppear - dt * 5);
+}
+
+/* ---------- ЧАСТИЦЫ UI ("+1", "РЕКОРД!") ---------- */
+function spawnUIText(x, y, text, color) {
+  uiTexts.push({ x, y, text, color, life: 1.2, max: 1.2, vy: -80, scale: 0.5 });
+}
+
+function updateUITexts(dt) {
+  for (let i = uiTexts.length - 1; i >= 0; i--) {
+    const t = uiTexts[i];
+    t.y += t.vy * dt;
+    t.life -= dt;
+    t.scale = Math.min(1, t.scale + dt * 4);
+    if (t.life <= 0) uiTexts.splice(i, 1);
+  }
+}
+
+/* ---------- ДЕНЬ/НОЧЬ: ПАДАЮЩИЕ ЗВЁЗДЫ ---------- */
+let nextFallingStar = 8 + Math.random() * 12;
+
+function updateFallingStars(dt, nightK) {
+  nextFallingStar -= dt;
+  if (nextFallingStar <= 0 && nightK > 0.3) {
+    nextFallingStar = 10 + Math.random() * 10;
+    const sx = rand(W * 0.1, W * 0.9);
+    const sy = rand(0, H * 0.3);
+    fallingStars.push({
+      x: sx, y: sy,
+      vx: rand(-300, -100), vy: rand(200, 400),
+      life: 1.2, max: 1.2
+    });
+  }
+  for (let i = fallingStars.length - 1; i >= 0; i--) {
+    const f = fallingStars[i];
+    f.x += f.vx * dt; f.y += f.vy * dt;
+    f.life -= dt;
+    if (f.life <= 0) fallingStars.splice(i, 1);
+  }
+}
+
+/* ---------- ПЫЛИНКИ / СВЕТЛЯЧКИ ---------- */
+let dustParticles = [];
+function updateDustParticles(dt, dayK) {
+  while (dustParticles.length < 18) {
+    dustParticles.push({
+      x: rand(0, W), y: rand(0, H),
+      vx: rand(-10, 10), vy: rand(-20, -5),
+      r: rand(0.8, 2.2),
+      ph: rand(0, TAU),
+      life: rand(3, 8), max: 8
+    });
+  }
+  for (let i = dustParticles.length - 1; i >= 0; i--) {
+    const p = dustParticles[i];
+    p.x += p.vx * dt + Math.sin(elapsed * 0.5 + p.ph) * 0.3;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life <= 0 || p.y < -10) dustParticles.splice(i, 1);
+  }
+}
+
+/* ============ ЧАСТЬ 2: звук — объёмная музыка и эффекты ============ */
+
+let AC = null, masterGain = null, musicGain = null, melGain = null, noiseBuf = null;
+let step = 0, nextTime = 0;
+let muted = false;
+let audioReady = false;
+
+// Реакция музыки на игру
+let musicTempo = 1.0;
+let musicMinor = false;
+let recordFanfare = 0;
+
+const SEMI = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+function freq(n) {
+  const m = n.match(/^([A-G])(#?)(\d)$/);
+  const midi = SEMI[m[1]] + (m[2] ? 1 : 0) + (parseInt(m[3], 10) + 1) * 12;
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+const MEL = [
+  'E5','','G5','','A5','','G5','',
+  'E5','','C5','','D5','','E5','',
+  'G5','','E5','','C5','','D5','',
+  'E5','','D5','','C5','','','',
+  'A4','','C5','','E5','','C5','',
+  'G4','','B4','','D5','','B4','',
+  'C5','','E5','','G5','','A5','',
+  'G5','','E5','','D5','','C5',''
+];
+
+const BASS = [
+  'C3','G3','C3','G3',
+  'F3','C4','F3','C4',
+  'G3','D4','G3','D4',
+  'C3','G3','C3','G3',
+  'A3','E3','A3','E3',
+  'F3','C4','F3','C4',
+  'G3','D4','G3','D4',
+  'C3','G3','C3','G3'
+];
+
+// Пэд из 3 нот
+const CHORDS = [
+  ['C4','E4','G4'],['C4','E4','G4'],
+  ['F3','A3','C4'],['F3','A3','C4'],
+  ['G3','B3','D4'],['G3','B3','D4'],
+  ['C4','E4','G4'],['C4','E4','G4'],
+  ['A3','C4','E4'],['A3','C4','E4'],
+  ['F3','A3','C4'],['F3','A3','C4'],
+  ['G3','B3','D4'],['G3','B3','D4'],
+  ['C4','E4','G4'],['C4','E4','G4']
+];
+
+// Минорные аккорды для последней жизни
+const CHORDS_MINOR = [
+  ['A3','C4','E4'],['A3','C4','E4'],
+  ['D3','F3','A3'],['D3','F3','A3'],
+  ['E3','G3','B3'],['E3','G3','B3'],
+  ['A3','C4','E4'],['A3','C4','E4'],
+  ['F3','A3','C4'],['F3','A3','C4'],
+  ['D3','F3','A3'],['D3','F3','A3'],
+  ['E3','G3','B3'],['E3','G3','B3'],
+  ['A3','C4','E4'],['A3','C4','E4']
+];
+
+// Арпеджио (второй голос)
+const ARP = [
+  'C5','E5','G5','E5','C5','E5','G5','E5',
+  'F4','A4','C5','A4','F4','A4','C5','A4',
+  'G4','B4','D5','B4','G4','B4','D5','B4',
+  'C5','E5','G5','E5','C5','E5','G5','E5',
+  'A4','C5','E5','C5','A4','C5','E5','C5',
+  'F4','A4','C5','A4','F4','A4','C5','A4',
+  'G4','B4','D5','B4','G4','B4','D5','B4',
+  'C5','E5','G5','E5','C5','E5','G5','E5'
+];
+
+const STEP = 0.25;
+
+function unlockAudio() {
+  if (audioReady) {
+    if (AC && AC.state === 'suspended') AC.resume();
+    return;
+  }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    if (unmuteBtn) unmuteBtn.classList.add('show');
+    return;
+  }
+  AC = new Ctx();
+  audioReady = true;
+
+  const comp = AC.createDynamicsCompressor();
+  comp.threshold.value = -12;
+  comp.knee.value = 24;
+  comp.ratio.value = 8;
+  comp.attack.value = 0.003;
+  comp.release.value = 0.22;
+  comp.connect(AC.destination);
+
+  masterGain = AC.createGain();
+  masterGain.gain.value = 0.6;
+  masterGain.connect(comp);
+
+  musicGain = AC.createGain();
+  musicGain.gain.value = muted ? 0 : 0.55;
+  musicGain.connect(masterGain);
+
+  // Мелодия — с feedback delay (реверберация без Convolver)
+  melGain = AC.createGain();
+  melGain.gain.value = 1;
+  melGain.connect(musicGain);
+  const delay = AC.createDelay(1);
+  delay.delayTime.value = STEP * 1.5;
+  const fb = AC.createGain(); fb.gain.value = 0.32;
+  const wet = AC.createGain(); wet.gain.value = 0.40;
+  melGain.connect(delay);
+  delay.connect(fb); fb.connect(delay);
+  delay.connect(wet); wet.connect(musicGain);
+
+  const delay2 = AC.createDelay(1);
+  delay2.delayTime.value = STEP * 0.75;
+  const fb2 = AC.createGain(); fb2.gain.value = 0.20;
+  const wet2 = AC.createGain(); wet2.gain.value = 0.25;
+  musicGain.connect(delay2);
+  delay2.connect(fb2); fb2.connect(delay2);
+  delay2.connect(wet2); wet2.connect(musicGain);
+
+  noiseBuf = makeNoise();
+  nextTime = AC.currentTime + 0.1;
+  setInterval(scheduleMusic, 90);
+
+  if (unmuteBtn) unmuteBtn.classList.remove('show');
+  if (AC.state === 'suspended') AC.resume();
+}
+
+function makeNoise() {
+  const buf = AC.createBuffer(1, Math.floor(AC.sampleRate * 0.2), AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+function scheduleMusic() {
+  if (!AC || muted) return;
+  while (nextTime < AC.currentTime + 0.35) {
+    const s = step % 64;
+    const stepDur = STEP * (1 / musicTempo);
+
+    const n = MEL[s];
+    if (n) tone(freq(n), nextTime, 0.24, 'triangle', 0.11, melGain);
+
+    if (s % 4 === 0) {
+      const chordArr = musicMinor ? CHORDS_MINOR : CHORDS;
+      pad(nextTime, chordArr[(s / 4) % 16], stepDur);
+    }
+
+    if (s % 2 === 0) {
+      const b = BASS[s / 2];
+      if (b) tone(freq(b), nextTime, 0.38, 'sine', 0.16, musicGain);
+    }
+
+    if (s % 2 === 0) {
+      const a = ARP[s];
+      if (a) tone(freq(a), nextTime, 0.18, 'sine', 0.055, musicGain);
+    }
+
+    if (s % 8 === 0) kick(nextTime);
+    hat(nextTime, s % 4 === 2 ? 0.06 : 0.03);
+    if (s % 8 === 4) snare(nextTime);
+
+    step++;
+    nextTime += stepDur;
+  }
+}
+
+function tone(f, t, dur, type, vol, dest) {
+  if (muted) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.value = f;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(dest || musicGain);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+function pad(t, notes, stepDur) {
+  if (muted) return;
+  const dur = (stepDur || STEP) * 4;
+  for (const n of notes) {
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq(n);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.045, t + 0.1);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(musicGain);
+    o.start(t); o.stop(t + dur + 0.05);
+  }
+}
+
+function kick(t) {
+  if (muted) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+  g.gain.setValueAtTime(0.35, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+  o.connect(g); g.connect(musicGain);
+  o.start(t); o.stop(t + 0.2);
+}
+
+function hat(t, vol) {
+  if (muted) return;
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(), g = AC.createGain();
+  f.type = 'highpass'; f.frequency.value = 6000;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+  s.connect(f); f.connect(g); g.connect(musicGain);
+  s.start(t); s.stop(t + 0.06);
+}
+
+function snare(t) {
+  if (muted) return;
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(), g = AC.createGain();
+  f.type = 'bandpass'; f.frequency.value = 1800;
+  g.gain.setValueAtTime(0.09, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+  s.connect(f); f.connect(g); g.connect(musicGain);
+  s.start(t); s.stop(t + 0.13);
+}
+
+function beep(f1, f2, dur, type, vol, delay) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + (delay || 0);
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f1, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(masterGain);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+let starPitchIdx = 0;
+function sfxStar() {
+  const base = [1318, 1480, 1568][starPitchIdx % 3];
+  starPitchIdx++;
+  beep(base, base * 1.33, 0.09, 'sine', 0.11);
+  beep(base * 1.33, base * 1.5, 0.13, 'sine', 0.11, 0.07);
+}
+
+let jumpPitchIdx = 0;
+function sfxJump(spring) {
+  if (spring) {
+    beep(280, 1500, 0.35, 'triangle', 0.12);
+    beep(400, 1800, 0.20, 'sine', 0.08, 0.05);
+  } else {
+    const base = [460, 490, 430][jumpPitchIdx % 3];
+    jumpPitchIdx++;
+    beep(base, base * 1.6, 0.13, 'triangle', 0.06);
+  }
+}
+
+function sfxBreak() {
+  beep(220, 90, 0.2, 'triangle', 0.12);
+  beep(180, 70, 0.15, 'sine', 0.08, 0.05);
+}
+function sfxOver()  {
+  beep(520, 110, 0.7, 'triangle', 0.11);
+  beep(400, 90, 0.5, 'sine', 0.08, 0.15);
+}
+function sfxLife() {
+  beep(660, 330, 0.3, 'triangle', 0.13);
+  beep(440, 220, 0.4, 'triangle', 0.10, 0.18);
+}
+function sfxRespawn() {
+  beep(523, 523, 0.08, 'sine', 0.09);
+  beep(659, 659, 0.08, 'sine', 0.09, 0.08);
+  beep(784, 784, 0.14, 'sine', 0.10, 0.16);
+}
+
+function sfxFanfare() {
+  if (!AC || muted) return;
+  const notes = ['C5', 'E5', 'G5', 'C6', 'E6'];
+  notes.forEach((n, i) => {
+    beep(freq(n), freq(n) * 1.01, 0.25, 'triangle', 0.12, i * 0.09);
+  });
+}
+
+function sfxCombo(level) {
+  if (!AC || muted) return;
+  const base = 880 + level * 110;
+  beep(base, base * 1.5, 0.12, 'sine', 0.10);
+}
+
+function sfxFade() {
+  if (!AC || muted) return;
+  beep(600, 200, 0.4, 'sine', 0.06);
+}
+
+/* ============ ЧАСТЬ 3: игровая логика ============ */
+
+// ================== ПРАВИЛА МИРА ==================
+// Правила — константы. Генератор не может их нарушить.
+const RULES = {
+  jumpH: 250,      // высота обычного прыжка (~250 единиц)
+  maxDx: 380,      // макс. горизонтальный перелёт за прыжок
+  shortMin: 55, shortMax: 85,   // короткий шаг между облаками
+  longMin: 105, longMax: 155,   // длинный прыжок
+  pinkBoost: 1.2,  // розовые облака подбрасывают на 20% выше
+  goldBoost: 1.5,  // золотые пружины — в полтора раза выше
+  dupChance: 0.45, // шанс облака-дублёра над золотым
+  edge:    30,     // отступ облаков от краёв экрана
+  birdFree: 150,   // бесполётная зона над облаком (кот на облаке неуязвим)
+  birdChance: 0.10 // шанс птицы
+};
+let sinceBird = 0;      // облаков с последней птицы
+let chainA = null, chainB = null; // два последних облака основной цепочки
+let forkLong = false;             // чередование коротких/длинных шагов
+
+function fillPlatforms() {
+  while (topY > cameraY - H * 0.6) {
+    // РАЗВИЛКА: короткий шаг и длинный прыжок чередуются.
+    // Сумма любых двух шагов <= 240 < высоты прыжка (250),
+    // поэтому с любого облака достижимо и следующее, и через одно —
+    // минимум 2 пути всегда, это зашито в правила, а не в удачу.
+    forkLong = !forkLong;
+    const lo = forkLong ? RULES.longMin : RULES.shortMin;
+    const hi = forkLong ? RULES.longMax : RULES.shortMax;
+    const gap = rand(lo, hi) * K;
+    spawnPlatform(topY - gap, gap);
+  }
+}
+
+function spawnPlatform(y, gap) {
+  const s = score;
+  const prev = chainA, prev2 = chainB;
+
+  // ПРАВИЛО 1: спец-облака не идут два раза подряд — маршрут всегда проходим
+  let type = 'normal';
+  const prevSpecial = prev && prev.type !== 'normal';
+  if (!prevSpecial) {
+    const r = Math.random();
+    if (s > 600 && r < 0.10) type = 'break';
+    else if (s > 150 && r < 0.28) type = 'moving';
+    else if (s > 200 && r < 0.38) type = 'spring';
+  }
+  // движущееся облако — только при маленьком зазоре
+  if (type === 'moving' && gap > 110 * K) type = 'normal';
+
+  // ПРАВИЛО 2: бюджет горизонтали — до нового облака из prev <= maxDx,
+  // и из prev2 (прыжок через одно) тоже <= maxDx. Клампы только сужают —
+  // недостижимых сочетаний не существует.
+  const margin = (RULES.edge + 42) * K;
+  let x;
+  if (!prev) x = W / 2;
+  else {
+    const want = prev.x + (Math.random() < 0.5 ? -1 : 1) * rand(40, RULES.maxDx * 0.8) * K;
+    x = clamp(want, margin, W - margin);
+    if (prev2) x = clamp(x, prev2.x - RULES.maxDx * K, prev2.x + RULES.maxDx * K);
+    if (Math.abs(x - prev.x) < 70 * K)
+      x = clamp(prev.x + (x >= prev.x ? 1 : -1) * 70 * K, margin, W - margin);
+  }
+
+  // ЦВЕТ = ХАРАКТЕР (правило пружинистости):
+  //   белые/голубые — обычные (x1.0), розовые — пружинят на 20% выше,
+  //   золотые с пружинкой — в 1.5 раза выше. Зазор между облаками всегда
+  //   <= 155 < 80% обычного прыжка, так что даже слабое облако
+  //   не оставит в тупике: пружинистость — только бонус.
+  let tint;
+  if (type === 'spring') tint = 5;
+  else tint = Math.random() < 0.22 ? 3 : [0, 1, 2, 4][Math.floor(Math.random() * 4)];
+
+  const p = {
+    type, x, y,
+    w: (type === 'break' ? 70 : 92) * K * rand(0.9, 1.15),
+    vy: 0,
+    dir: Math.random() < 0.5 ? -1 : 1,
+    t: Math.random() * 6,
+    dead: false,
+    rot: 0,
+    sq: 0,
+    tint,
+    hasSpring: false,
+    appear: 0,
+    fadeT: 0,
+    fadeMax: (type === 'normal' && s > 900 && Math.random() < 0.08) ? 2.0 : 0
+  };
+  if (p.fadeMax > 0) p.type = 'fade';
+  platforms.push(p);
+
+  // ОБЛАКО-ДУБЛЁР над золотым: верхний путь, доступный только с пружиной
+  // (270-310 единиц — меньше высоты золотого прыжка 375, больше обычной 250).
+  if (type === 'spring' && Math.random() < RULES.dupChance) {
+    const dupX = clamp(p.x + (Math.random() < 0.5 ? -1 : 1) * rand(120, 300) * K,
+                       margin, W - margin);
+    platforms.push({
+      type: 'normal', x: dupX, y: p.y - rand(270, 310) * K,
+      w: 92 * K, vy: 0, dir: 1, t: Math.random() * 6, dead: false, rot: 0, sq: 0,
+      tint: [0, 1, 2, 4][Math.floor(Math.random() * 4)], hasSpring: false,
+      appear: 0, fadeT: 0, fadeMax: 0
+    });
+    // звезда над дублёром — награда за верхний путь
+    stars.push({
+      x: dupX, y: p.y - rand(340, 380) * K, r: 11 * K,
+      t: Math.random() * 6, taken: false, appear: 0
+    });
+  }
+
+  chainB = chainA; chainA = p;
+  topY = y;
+  sinceBird++;
+
+  // Звёзды над своим облаком — в пределах прыжка
+  if (type !== 'break' && Math.random() < 0.35) {
+    stars.push({
+      x: clamp(p.x + rand(-46, 46) * K, 20 * K, W - 20 * K),
+      y: y - rand(55, 95) * K,
+      r: 11 * K,
+      t: Math.random() * 6,
+      taken: false,
+      appear: 0
+    });
+  }
+
+  // ПТИЦЫ: одна на экране, не чаще раза в 4 облака,
+  // всегда выше бесполётной зоны — стоя на облаке, кот неуязвим.
+  if (s > 600 && sinceBird >= 4 && birds.length === 0 && Math.random() < RULES.birdChance) {
+    sinceBird = 0;
+    birds.push({
+      x: Math.random() < 0.5 ? -60 * K : W + 60 * K,
+      y: y - (RULES.birdFree + rand(0, 60)) * K,
+      r: 16 * K,
+      vx: (Math.random() < 0.5 ? 1 : -1) * rand(70, 120) * K,
+      t: Math.random() * 6
+    });
+  }
+}
+
+function startGame() {
+  state = STATE.PLAY;
+  score = 0; starsCount = 0; cameraY = 0; elapsed = 0; shake = 0; record = false;
+  lives = 3; flash = 0;
+  combo = 0; comboT = 0; comboMax = 0;
+  springCount = 0;
+  sinceBird = 0;
+  chainA = null; chainB = null; forkLong = false;
+  uiTexts = [];
+  menuAppear = 0; overAppear = 0;
+  zoomPulse = 0;
+  musicTempo = 1.0; musicMinor = false; recordFanfare = 0;
+  player = { x: W / 2, y: H * 0.72, vx: 0, vy: -675 * K, r: 26 * K,
+             squash: 0, tilt: 0, blink: 3, inv: 0, trailT: 0,
+             happy: 0, scared: 0, breath: 0, earTwitch: 0 };
+  platforms = []; stars = []; birds = []; particles = []; fallingStars = [];
+  dustParticles = [];
+  const first = { type: 'normal', x: W / 2, y: player.y + 100 * K, w: 110 * K,
+                  vy: 0, dir: 1, t: 0, dead: false, rot: 0, hasSpring: false, sq: 0,
+                  tint: Math.floor(Math.random() * 5), appear: 1, fadeT: 0, fadeMax: 0 };
+  platforms.push(first);
+  topY = first.y;
+  fillPlatforms();
+}
+
+function update(dt) {
+  elapsed += dt;
+  if (shake > 0) shake = Math.max(0, shake - dt * 2);
+  if (flash > 0) flash = Math.max(0, flash - dt * 2);
+  if (player.inv > 0) player.inv -= dt;
+
+  // Комбо-таймер
+  if (comboT > 0) {
+    comboT -= dt;
+    if (comboT <= 0) {
+      comboMax = Math.max(comboMax, combo);
+      combo = 0;
+    }
+  }
+
+  // Музыка реагирует на скорость
+  const speedK = clamp(Math.abs(player.vy) / (950 * K), 0, 1);
+  musicTempo = 1.0 + speedK * 0.12;
+  musicMinor = lives === 1;
+
+  // Анимации кота
+  player.breath += dt * 2.5;
+  player.earTwitch -= dt;
+  if (player.earTwitch < -0.5) player.earTwitch = rand(1.5, 4);
+  if (player.happy > 0) player.happy -= dt;
+  if (player.scared > 0) player.scared -= dt;
+
+  if (touchX !== null) {
+    const desired = clamp((touchX - player.x) * 6, -440 * K, 440 * K);
+    player.vx += (desired - player.vx) * Math.min(1, dt * 10);
+  } else {
+    player.vx *= Math.pow(0.002, dt);
+  }
+  player.x = clamp(player.x + player.vx * dt, player.r, W - player.r);
+  if (player.x <= player.r || player.x >= W - player.r) player.vx = 0;
+
+  player.vy = Math.min(player.vy + 1250 * K * dt, 950 * K);
+  player.y += player.vy * dt;
+  player.tilt = clamp(player.vx / (400 * K), -1, 1) * 0.35;
+  if (player.squash > 0) player.squash = Math.max(0, player.squash - dt * 4);
+  player.blink -= dt;
+  if (player.blink < -0.25) player.blink = rand(2, 5);
+
+  player.trailT -= dt;
+  if (player.trailT <= 0) {
+    player.trailT = 0.05;
+    particles.push({
+      x: player.x, y: player.y + player.r * 0.4,
+      vx: rand(-15, 15) * K, vy: rand(20, 60) * K,
+      r: rand(4, 8) * K, life: 0.4, max: 0.4, color: '#FFFFFF', kind: 'dot'
+    });
+  }
+
+  cameraY = Math.min(cameraY, player.y - H * 0.42);
+  score = Math.max(score, (H * 0.72 - player.y) / (8 * K));
+
+  // Обновление платформ
+  for (const p of platforms) {
+    p.t += dt;
+    if (p.appear < 1) p.appear = Math.min(1, p.appear + dt * 4);
+    if (p.sq > 0) p.sq = Math.max(0, p.sq - dt * 3);
+
+    // Исчезающие облака: таймер после первого касания
+    if (p.fadeMax > 0 && p.fadeT > 0) {
+      p.fadeT -= dt;
+      if (p.fadeT <= 0 && !p.dead) {
+        p.dead = true;
+        p.vy = -100 * K;
+        sfxFade();
+      }
+    }
+
+    if (p.type === 'moving') {
+      p.x += p.dir * (60 + Math.min(score, 1500) * 0.05) * K * dt;
+      if (p.x < p.w / 2 + 8) { p.x = p.w / 2 + 8; p.dir = 1; }
+      if (p.x > W - p.w / 2 - 8) { p.x = W - p.w / 2 - 8; p.dir = -1; }
+    }
+    if (p.dead) {
+      p.vy += 2200 * K * dt;
+      p.y += p.vy * dt;
+      p.rot += dt * 3;
+    }
+  }
+
+  // Столкновение
+  if (player.vy > 0) {
+    for (const p of platforms) {
+      if (p.dead) continue;
+      if (Math.abs(player.x - p.x) < p.w / 2 + player.r * 0.6 &&
+          player.y + player.r > p.y &&
+          player.y + player.r < p.y + 26 * K + player.vy * dt) {
+        bounceOn(p);
+        break;
+      }
+    }
+  }
+
+  fillPlatforms();
+  platforms = platforms.filter(p => p.y - cameraY < H + 320 * K);
+
+  // Звёзды
+  for (const s of stars) {
+    s.t += dt;
+    if (s.appear < 1) s.appear = Math.min(1, s.appear + dt * 5);
+    const dx = player.x - s.x, dy = player.y - s.y;
+    if (dx * dx + dy * dy < (s.r + player.r) * (s.r + player.r)) {
+      s.taken = true;
+      starsCount++;
+      // Комбо
+      combo++;
+      comboT = 3.0;
+      comboMax = Math.max(comboMax, combo);
+      const mult = combo >= 3 ? 2 : 1;
+      if (combo >= 3 && combo % 3 === 0) {
+        sfxCombo(combo);
+        spawnUIText(s.x, s.y - 30 * K, '×2!', '#FFD700');
+        zoomPulse = 0.5;
+      } else {
+        sfxStar();
+        spawnUIText(s.x, s.y - 30 * K, '+' + mult, '#FFD54F');
+      }
+      player.happy = 0.5;
+      sparkle(s.x, s.y, '#FFD54F', 10);
+      particles.push({ kind: 'ring', x: s.x, y: s.y, r: s.r, life: 0.45, max: 0.45, color: '#FFE082' });
+    }
+  }
+  stars = stars.filter(s => !s.taken && s.y - cameraY < H + 120 * K);
+
+  // Птицы
+  for (const b of birds) {
+    b.x += b.vx * dt;
+    b.t += dt;
+    if (player.inv > 0) continue;
+    const dx = player.x - b.x, dy = player.y - b.y;
+    if (dx * dx + dy * dy < (b.r + player.r * 0.8) * (b.r + player.r * 0.8)) {
+      for (let i = 0; i < 8; i++)
+        particles.push({
+          x: b.x, y: b.y, vx: rand(-120, 120) * K, vy: rand(-180, 40) * K,
+          r: rand(3, 6) * K, life: rand(0.4, 0.8), max: 0.8, color: '#FFAB91', kind: 'dot'
+        });
+      loseLife();
+      return;
+    }
+  }
+  birds = birds.filter(b => (b.vx > 0 ? b.x < W + 90 * K : b.x > -90 * K)
+                        && b.y - cameraY < H + 200 * K);
+
+  // Частицы
+  for (const q of particles) {
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    q.vy += 600 * K * dt; q.life -= dt;
+  }
+  particles = particles.filter(q => q.life > 0);
+
+  // UI-тексты
+  updateUITexts(dt);
+
+  // Падающие звёзды (ночь)
+  const t = clamp(score / 2600, 0, 1);
+  updateFallingStars(dt, t);
+
+  // Пылинки
+  updateDustParticles(dt, 1 - t);
+
+  if (player.y - cameraY > H + player.r + 60) loseLife();
+}
+
+function bounceOn(p) {
+  // Исчезающие — после отскока начинают таймер
+  if (p.type === 'fade' && p.fadeMax > 0 && p.fadeT === 0) {
+    p.fadeT = p.fadeMax;
+  }
+
+  // Ломкое облако даёт один полноценный прыжок, потом отваливается
+  if (p.type === 'break' && !p.dead) {
+    p.dead = true;
+    p.vy = 150 * K;
+    player.y = p.y - player.r;
+    player.vy = -790 * K;
+    player.squash = 1;
+    player.scared = 0.7;
+    sfxJump(false);
+    sfxBreak();
+    puff(p.x, p.y + 10 * K, '#B0BEC5', 9);
+    return;
+  }
+
+  player.y = p.y - player.r;
+  p.sq = 1;
+  // ПРУЖИНИСТОСТЬ ПО ЦВЕТУ: золотая пружина x1.5, розовое облако x1.2,
+  // обычные — x1.0. Бонус не обязателен: максимальный зазор < обычного прыжка.
+  const isSpringCloud = p.type === 'spring';
+  const isPink = p.type !== 'spring' && p.tint === 3;
+  const boost = isSpringCloud ? RULES.goldBoost : isPink ? RULES.pinkBoost : 1;
+  player.vy = -790 * K * boost;
+  player.squash = 1;
+  if (isSpringCloud) {
+    player.scared = 0.9;
+    player.happy = 0;
+    sfxJump(true);
+    puff(p.x, p.y + 10 * K, '#FFE082', 8);
+    sparkle(p.x, p.y - 20 * K, '#FFD54F', 6);
+  } else {
+    player.happy = 0.7;
+    player.scared = 0;
+    sfxJump(isPink);
+    puff(p.x, p.y + 10 * K, '#FFFFFF', 6);
+    if (isPink) sparkle(p.x, p.y - 20 * K, '#F8BBD0', 6);
+  }
+}
+
+function loseLife() {
+  lives--;
+  flash = 1;
+  shake = 1;
+  sfxLife();
+  sparkle(player.x, player.y, '#FF8A65', 14);
+  // Сброс комбо при потере жизни
+  combo = 0; comboT = 0;
+  if (lives <= 0) { gameOver(); return; }
+
+  // возрождение: сначала ближайшее НОРМАЛЬНОЕ облако ниже,
+  // потом любое живое ниже, потом самое нижнее живое
+  let target = null;
+  for (const p of platforms) {
+    if (p.dead || p.type === 'break') continue;
+    if (p.y > player.y && (!target || p.y < target.y)) target = p;
+  }
+  if (!target) {
+    for (const p of platforms) {
+      if (p.dead) continue;
+      if (p.y > player.y && (!target || p.y < target.y)) target = p;
+    }
+  }
+  if (!target) {
+    for (const p of platforms) {
+      if (p.dead) continue;
+      if (!target || p.y > target.y) target = p;
+    }
+  }
+  if (!target) {
+    target = { type: 'normal', x: rand(W * 0.3, W * 0.7), y: cameraY + H * 0.75,
+               w: 110 * K, vy: 0, dir: 1, t: 0, dead: false, rot: 0, sq: 0,
+               tint: Math.floor(Math.random() * 5), hasSpring: false,
+               appear: 1, fadeT: 0, fadeMax: 0 };
+    platforms.push(target);
+  }
+
+  player.x = clamp(target.x, player.r, W - player.r);
+  player.y = target.y - player.r;
+  player.vx = 0;
+  player.vy = -790 * K;
+  player.squash = 1;
+  player.inv = 2.2;
+  if (target.y - cameraY > H * 0.8) cameraY = target.y - H * 0.7;
+  sfxRespawn();
+  sparkle(player.x, player.y, '#81D4FA', 10);
+}
+
+function puff(x, y, color, n) {
+  for (let i = 0; i < n; i++)
+    particles.push({
+      x: x + rand(-14, 14) * K, y: y + rand(-4, 10) * K,
+      vx: rand(-90, 90) * K, vy: rand(-130, 20) * K,
+      r: rand(3, 7) * K, life: rand(0.3, 0.6), max: 0.6, color, kind: 'dot'
+    });
+}
+
+function sparkle(x, y, color, n) {
+  for (let i = 0; i < n; i++)
+    particles.push({
+      x, y,
+      vx: rand(-150, 150) * K, vy: rand(-230, -40) * K,
+      r: rand(2, 5) * K, life: rand(0.4, 0.8), max: 0.8, color, kind: 'dot'
+    });
+}
+
+function gameOver() {
+  state = STATE.OVER;
+  overTime = elapsed;
+  shake = 1;
+  sfxOver();
+  const s = Math.floor(score);
+  record = s > best;
+  if (record) {
+    best = s;
+    localStorage.setItem('kittyBest', best);
+    sfxFanfare();
+    spawnUIText(W / 2, H * 0.5, 'РЕКОРД!', '#FFD700');
+  }
+  for (let i = 0; i < 16; i++)
+    particles.push({
+      x: player.x, y: player.y,
+      vx: rand(-220, 220) * K, vy: rand(-320, 80) * K,
+      r: rand(3, 8) * K, life: rand(0.5, 1), max: 1,
+      color: ['#FF8A65', '#FFD54F', '#90CAF9'][i % 3], kind: 'dot'
+    });
+}
+
+function updateIdle(dt) {
+  elapsed += dt;
+  if (shake > 0) shake = Math.max(0, shake - dt * 2);
+  if (flash > 0) flash = Math.max(0, flash - dt * 2);
+  if (state === STATE.MENU) {
+    menuBlink -= dt;
+    if (menuBlink < -0.25) menuBlink = rand(2, 5);
+  }
+  updateUIPhase(dt);
+  updateUITexts(dt);
+
+  // Частицы
+  for (const q of particles) {
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    q.vy += 600 * K * dt; q.life -= dt;
+  }
+  particles = particles.filter(q => q.life > 0);
+
+  // Падающие звёзды в меню
+  const t = clamp(score / 2600, 0, 1);
+  updateFallingStars(dt, 0.5);
+  updateDustParticles(dt, 1);
+}
+
+/* ============ ЧАСТЬ 4: рендер — графика, анимации, UI ============ */
+
+// ---------- Утилиты ----------
+function hexToRgb(h) {
+  const n = parseInt(h.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function mixColor(a, b, t) {
+  const A = hexToRgb(a), B = hexToRgb(b);
+  return 'rgb(' + Math.round(lerp(A[0], B[0], t)) + ',' +
+                  Math.round(lerp(A[1], B[1], t)) + ',' +
+                  Math.round(lerp(A[2], B[2], t)) + ')';
+}
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+function roundRectPath(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+function starPath(c, x, y, r, rot) {
+  c.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a = rot + i * TAU / 5 - Math.PI / 2;
+    const b = a + TAU / 10;
+    c.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+    c.lineTo(x + Math.cos(b) * r * 0.45, y + Math.sin(b) * r * 0.45);
+  }
+  c.closePath();
+}
+function heartPath(c, x, y, s) {
+  c.beginPath();
+  c.moveTo(x, y + s * 0.35);
+  c.bezierCurveTo(x - s, y - s * 0.45, x - s * 0.5, y - s * 1.15, x, y - s * 0.45);
+  c.bezierCurveTo(x + s * 0.5, y - s * 1.15, x + s, y - s * 0.45, x, y + s * 0.35);
+  c.closePath();
+}
+
+// ---------- Виньетка (кэшируется) ----------
+let vigC = null;
+function drawVignette() {
+  if (!vigC || vigC.width !== W || vigC.height !== H) {
+    vigC = document.createElement('canvas');
+    vigC.width = W; vigC.height = H;
+    const p = vigC.getContext('2d');
+    const g = p.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35,
+                                     W / 2, H / 2, Math.max(W, H) * 0.78);
+    g.addColorStop(0, 'rgba(10,20,50,0)');
+    g.addColorStop(1, 'rgba(10,20,50,0.32)');
+    p.fillStyle = g;
+    p.fillRect(0, 0, W, H);
+  }
+  ctx.drawImage(vigC, 0, 0, W, H);
+}
+
+// ---------- Солнце, луна, звёзды, падающие звёзды ----------
+function drawCelestials(t) {
+  // Солнце с лучами и свечением (уходит вниз на закате)
+  const sunA = clamp(1 - t * 1.8, 0, 1);
+  if (sunA > 0.01) {
+    const sx = W * 0.76, sy = lerp(H * 0.14, H * 0.6, t);
+    const R = 46 * K;
+    const glow = ctx.createRadialGradient(sx, sy, R * 0.2, sx, sy, R * 3);
+    glow.addColorStop(0, 'rgba(255,244,200,' + 0.5 * sunA + ')');
+    glow.addColorStop(1, 'rgba(255,244,200,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(sx - R * 3, sy - R * 3, R * 6, R * 6);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(gameTime * 0.15);
+    ctx.strokeStyle = 'rgba(255,240,180,' + 0.22 * sunA + ')';
+    ctx.lineWidth = 3 * K;
+    for (let i = 0; i < 8; i++) {
+      const a = i * TAU / 8;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * R * 1.35, Math.sin(a) * R * 1.35);
+      ctx.lineTo(Math.cos(a) * R * 1.9, Math.sin(a) * R * 1.9);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = sunA;
+    ctx.fillStyle = '#FFF3C4';
+    ctx.beginPath(); ctx.arc(sx, sy, R * 0.75, 0, TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.arc(sx - R * 0.2, sy - R * 0.2, R * 0.3, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Луна с кратерами и ореолом
+  const moonA = clamp((t - 0.25) * 2, 0, 1);
+  if (moonA > 0.01) {
+    const mx = W * 0.22, my = H * 0.14, R = 34 * K;
+    const glow = ctx.createRadialGradient(mx, my, R * 0.4, mx, my, R * 2.6);
+    glow.addColorStop(0, 'rgba(207,226,255,' + 0.4 * moonA + ')');
+    glow.addColorStop(1, 'rgba(207,226,255,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(mx - R * 2.6, my - R * 2.6, R * 5.2, R * 5.2);
+    ctx.globalAlpha = moonA;
+    ctx.fillStyle = '#ECEFF1';
+    ctx.beginPath(); ctx.arc(mx, my, R, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#B0BEC5';
+    ctx.beginPath(); ctx.arc(mx - R * 0.3, my - R * 0.15, R * 0.18, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(mx + R * 0.25, my + R * 0.3, R * 0.13, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(mx + R * 0.1, my - R * 0.4, R * 0.09, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Ночные звёзды с мерцанием
+  if (t > 0.05) {
+    for (const s of bgStars) {
+      const a = t * (0.55 + 0.45 * Math.abs(Math.sin(elapsed * 0.9 + s.tw)));
+      ctx.fillStyle = 'rgba(255,255,255,' + a + ')';
+      ctx.beginPath(); ctx.arc(s.x * W, s.y * H, s.r, 0, TAU); ctx.fill();
+      if (s.r > 1.8) {
+        ctx.strokeStyle = 'rgba(255,255,255,' + a * 0.6 + ')';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(s.x * W - s.r * 2.2, s.y * H); ctx.lineTo(s.x * W + s.r * 2.2, s.y * H);
+        ctx.moveTo(s.x * W, s.y * H - s.r * 2.2); ctx.lineTo(s.x * W, s.y * H + s.r * 2.2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // Падающие звёзды (ночь)
+  for (const f of fallingStars) {
+    const k = f.life / f.max;
+    const tx = f.x - f.vx * 0.09, ty = f.y - f.vy * 0.09;
+    const lg = ctx.createLinearGradient(f.x, f.y, tx, ty);
+    lg.addColorStop(0, 'rgba(255,255,255,' + 0.95 * k + ')');
+    lg.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.strokeStyle = lg;
+    ctx.lineWidth = 3 * K;
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.lineTo(tx, ty); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,' + k + ')';
+    ctx.beginPath(); ctx.arc(f.x, f.y, 3 * K, 0, TAU); ctx.fill();
+  }
+}
+
+// Северное сияние — мягкие ленты
+function drawAurora(a) {
+  if (a <= 0.01) return;
+  const cols = ['#64FFDA', '#B388FF', '#82B1FF'];
+  ctx.save();
+  ctx.globalAlpha = a * 0.07;
+  for (let k = 0; k < 3; k++) {
+    ctx.beginPath();
+    const baseY = H * (0.18 + k * 0.1);
+    ctx.moveTo(-60, baseY);
+    for (let x = -60; x <= W + 60; x += 44) {
+      const y = baseY + Math.sin(x * 0.006 + elapsed * 0.25 + k * 2.1) * 34 * K +
+                Math.sin(x * 0.013 - elapsed * 0.15) * 12 * K;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W + 60, baseY + 100 * K);
+    ctx.lineTo(-60, baseY + 100 * K);
+    ctx.closePath();
+    ctx.fillStyle = cols[k];
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---------- Параллакс-облака фона ----------
+function drawBgLayers(t) {
+  const span = H * 1.8 + 240;
+  for (const c of bgClouds) {
+    let py = c.y * H * 1.8 - cameraY * c.par;
+    py = ((py % span) + span) % span - 120;
+    let px = (c.x * (W + 240) + gameTime * c.sp) % (W + 240);
+    if (px < 0) px += (W + 240);
+    px -= 120;
+    const sc = c.s * K * 0.85;
+    const spr = CLOUD_CACHE['normal_' + c.ti];
+    if (!spr) continue;
+    ctx.globalAlpha = c.a * (1 - 0.4 * t);
+    ctx.drawImage(spr, px - CLOUD_SIZE * sc / 2, py - CLOUD_SIZE * sc / 2,
+                  CLOUD_SIZE * sc, CLOUD_SIZE * sc);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// Цвет пылинок по времени суток
+function dustColor(t, a) {
+  if (t < 0.35) return 'rgba(255,224,130,' + a + ')';
+  if (t > 0.65) return 'rgba(178,255,110,' + a + ')';
+  return 'rgba(255,255,255,' + a + ')';
+}
+
+function drawDust(t) {
+  for (const p of dustParticles) {
+    const a = 0.3 * clamp(p.life, 0, 1);
+    const x = p.x, y = p.y;
+    if (t > 0.35 && t < 0.65) {
+      ctx.fillStyle = dustColor(t, a * 0.5);
+      ctx.beginPath(); ctx.arc(x, y, p.r * 1.2, 0, TAU); ctx.fill();
+    } else {
+      const pulse = t > 0.65 ? (0.6 + 0.4 * Math.sin(elapsed * 2 + p.ph)) : 1;
+      ctx.fillStyle = dustColor(t, a * pulse);
+      ctx.beginPath(); ctx.arc(x, y, p.r, 0, TAU); ctx.fill();
+      if (t > 0.65) {
+        const g = ctx.createRadialGradient(x, y, 0, x, y, p.r * 4);
+        g.addColorStop(0, 'rgba(178,255,110,' + 0.18 * a * pulse + ')');
+        g.addColorStop(1, 'rgba(178,255,110,0)');
+        ctx.fillStyle = g;
+        ctx.fillRect(x - p.r * 4, y - p.r * 4, p.r * 8, p.r * 8);
+      }
+    }
+  }
+}
+
+// ---------- Объекты мира ----------
+function drawCloudPlatform(p) {
+  const type = p.type === 'spring' ? 'normal' : p.type;
+  const spr = CLOUD_CACHE[type + '_' + p.tint];
+  if (!spr) return;
+
+  let alpha = 1;
+  const sc = (p.w / 84) * easeOutBack(clamp(p.appear, 0, 1));
+  const sy = 1 - p.sq * 0.26;
+  let rot = 0;
+
+  if (p.dead) {
+    alpha = clamp(1 - p.rot, 0, 1);
+    rot = p.rot * 0.6;
+  } else if (p.type === 'fade' && p.fadeT > 0) {
+    const k = 1 - p.fadeT / p.fadeMax;
+    alpha = 0.45 + 0.55 * Math.abs(Math.sin(elapsed * (3 + k * 4)));
+  }
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(p.x, p.y);
+  if (rot) ctx.rotate(rot);
+  ctx.scale(sc, sc * sy);
+  ctx.drawImage(spr, -CLOUD_SIZE / 2, -CLOUD_SIZE / 2, CLOUD_SIZE, CLOUD_SIZE);
+
+  // Пружинка на облаке
+  if ((p.hasSpring || p.type === 'spring') && !p.dead) {
+    ctx.strokeStyle = '#FFD54F';
+    ctx.lineWidth = p.type === 'spring' ? 4 : 3;
+    ctx.lineCap = 'round';
+    const sw = p.type === 'spring' ? 20 : 14;
+    ctx.beginPath();
+    ctx.moveTo(-sw, 6);
+    ctx.quadraticCurveTo(-sw * 0.5, -10, 0, 6);
+    ctx.quadraticCurveTo(sw * 0.5, -10, sw, 6);
+    ctx.stroke();
+    ctx.fillStyle = '#FFB300';
+    ctx.beginPath(); ctx.arc(-sw, 6, 4.5, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(sw, 6, 4.5, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawStarItem(s) {
+  const ap = easeOutBack(clamp(s.appear, 0, 1));
+  const pulse = 1 + 0.09 * Math.sin(s.t * 2.5);
+  const r = s.r * ap * pulse;
+  const g = ctx.createRadialGradient(s.x, s.y, r * 0.3, s.x, s.y, r * 3.2);
+  g.addColorStop(0, 'rgba(255,213,79,0.4)');
+  g.addColorStop(1, 'rgba(255,213,79,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(s.x - r * 3.2, s.y - r * 3.2, r * 6.4, r * 6.4);
+  ctx.fillStyle = '#FFD54F';
+  starPath(ctx, s.x, s.y, r, s.t * 0.6);
+  ctx.fill();
+  ctx.fillStyle = '#FFF59D';
+  starPath(ctx, s.x, s.y, r * 0.62, s.t * 0.6);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,' + (0.4 + 0.4 * Math.sin(s.t * 3)) * 0.6 + ')';
+  ctx.beginPath(); ctx.arc(s.x + r * 0.9, s.y - r * 0.9, 2 * K, 0, TAU); ctx.fill();
+}
+
+function drawBird(b) {
+  const flap = Math.sin(b.t * 9);
+  const d = b.vx > 0 ? 1 : -1;
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.scale(d, 1); // всегда смотрит по ходу полёта
+  const r = b.r;
+  // хвост
+  ctx.fillStyle = '#7EC8E3';
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.7, -r * 0.1);
+  ctx.lineTo(-r * 1.35, -r * 0.45);
+  ctx.lineTo(-r * 1.25, r * 0.25);
+  ctx.closePath();
+  ctx.fill();
+  // тело — круглое, голубое
+  ctx.fillStyle = '#8ED4F0';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r * 0.85, r * 0.72, 0, 0, TAU);
+  ctx.fill();
+  // животик
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath();
+  ctx.ellipse(r * 0.1, r * 0.22, r * 0.45, r * 0.34, 0, 0, TAU);
+  ctx.fill();
+  // крылышко — машет
+  ctx.fillStyle = '#5FB6DC';
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.15, -r * 0.05);
+  ctx.quadraticCurveTo(-r * 0.75, -r * (0.55 + flap * 0.35), -r * 0.95, r * (0.1 + flap * 0.2));
+  ctx.quadraticCurveTo(-r * 0.45, r * 0.25, -r * 0.15, -r * 0.05);
+  ctx.closePath();
+  ctx.fill();
+  // хохолок
+  ctx.fillStyle = '#5FB6DC';
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.1, -r * 0.62);
+  ctx.quadraticCurveTo(r * 0.05, -r * 1.15, r * 0.25, -r * 0.6);
+  ctx.closePath();
+  ctx.fill();
+  // клюв — оранжевый
+  ctx.fillStyle = '#FF9800';
+  ctx.beginPath();
+  ctx.moveTo(r * 0.72, -r * 0.08);
+  ctx.lineTo(r * 1.18, r * 0.02);
+  ctx.lineTo(r * 0.72, r * 0.18);
+  ctx.closePath();
+  ctx.fill();
+  // глаз с бликом
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(r * 0.38, -r * 0.18, r * 0.17, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#37474F';
+  ctx.beginPath(); ctx.arc(r * 0.43, -r * 0.18, r * 0.09, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(r * 0.47, -r * 0.22, r * 0.035, 0, TAU); ctx.fill();
+  // румянец
+  ctx.fillStyle = 'rgba(255,138,101,0.4)';
+  ctx.beginPath(); ctx.ellipse(r * 0.45, r * 0.02, r * 0.12, r * 0.08, 0, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const q of particles) {
+    const k = q.life / q.max;
+    if (q.kind === 'ring') {
+      ctx.globalAlpha = k * 0.7;
+      ctx.strokeStyle = q.color;
+      ctx.lineWidth = 3 * K;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, q.r + (1 - k) * 42 * K, 0, TAU);
+      ctx.stroke();
+    } else {
+      ctx.globalAlpha = k;
+      ctx.fillStyle = q.color;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, q.r * (0.5 + 0.5 * k), 0, TAU);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- КОТИК ----------
+function drawCat(x, y, o) {
+  const r = o.r;
+  const invFlicker = o.inv > 0 ? (Math.sin(elapsed * 30) > 0 ? 1 : 0.35) : 1;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(o.tilt * 0.5);
+  ctx.globalAlpha = invFlicker;
+
+  const squash = o.squash || 0;
+  let sx = 1 + squash * 0.18;
+  let sy = 1 - squash * 0.22;
+  if (squash < 0.05) sy *= 1 + Math.sin(o.breath || 0) * 0.022;
+  ctx.scale(sx, sy);
+
+  const fur = '#FFB74D', dark = '#EF9A3C', inner = '#FF8A65';
+  const wig = (o.earTwitch !== undefined && o.earTwitch > 0 && o.earTwitch < 0.3)
+              ? Math.sin(elapsed * 45) * 0.22 : 0;
+
+  // Хвост с волной
+  const tw = Math.sin(o.tailPh || 0) * 0.5;
+  ctx.strokeStyle = fur;
+  ctx.lineWidth = r * 0.3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(r * 0.55, r * 0.35);
+  ctx.quadraticCurveTo(r * 1.25, r * (0.25 + tw * 0.4), r * 1.05, r * (-0.35 + tw * 0.5));
+  ctx.stroke();
+
+  // Тело
+  ctx.fillStyle = fur;
+  ctx.beginPath();
+  ctx.ellipse(0, r * 0.38, r * 0.78, r * 0.6, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = '#FFE0B2';
+  ctx.beginPath();
+  ctx.ellipse(0, r * 0.48, r * 0.45, r * 0.34, 0, 0, TAU);
+  ctx.fill();
+
+  // Голова
+  ctx.fillStyle = fur;
+  ctx.beginPath();
+  ctx.arc(0, -r * 0.28, r * 0.72, 0, TAU);
+  ctx.fill();
+
+  // Уши (с дёрганием)
+  for (const side of [-1, 1]) {
+    ctx.save();
+    ctx.translate(side * r * 0.42, -r * 0.82);
+    ctx.rotate(side * (0.25 + wig));
+    ctx.fillStyle = fur;
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.22, r * 0.1);
+    ctx.lineTo(0, -r * 0.42);
+    ctx.lineTo(r * 0.22, r * 0.1);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = inner;
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.11, r * 0.02);
+    ctx.lineTo(0, -r * 0.26);
+    ctx.lineTo(r * 0.11, r * 0.02);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Полоски на голове
+  ctx.strokeStyle = dark;
+  ctx.lineWidth = r * 0.09;
+  ctx.lineCap = 'round';
+  for (const dx of [-0.16, 0, 0.16]) {
+    ctx.beginPath();
+    ctx.moveTo(dx * r, -r * 0.92);
+    ctx.lineTo(dx * r, -r * 0.72);
+    ctx.stroke();
+  }
+
+  // Глаза: испуг / довольные / закрытые / обычные
+  const ex = r * 0.26, ey = -r * 0.3;
+  const closed = o.blink !== undefined && o.blink < 0;
+  const happy = o.happy > 0;
+  const fastFall = o.vy !== undefined && o.vy > 900 * K;
+  const scaredNow = (o.scared !== undefined && o.scared > 0) || fastFall;
+
+  if (scaredNow) {
+    // Испуг: огромные выпученные глаза с мелкими зрачками
+    for (const side of [-1, 1]) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath(); ctx.arc(side * ex, ey, r * 0.21, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#4E342E';
+      ctx.lineWidth = r * 0.04;
+      ctx.beginPath(); ctx.arc(side * ex, ey, r * 0.21, 0, TAU); ctx.stroke();
+      ctx.fillStyle = '#4E342E';
+      ctx.beginPath(); ctx.arc(side * ex, ey, r * 0.07, 0, TAU); ctx.fill();
+    }
+  } else if (happy) {
+    ctx.strokeStyle = '#4E342E';
+    ctx.lineWidth = r * 0.1;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(side * ex, ey + r * 0.06, r * 0.13, Math.PI * 1.1, Math.PI * 1.9);
+      ctx.stroke();
+    }
+  } else if (closed) {
+    ctx.strokeStyle = '#4E342E';
+    ctx.lineWidth = r * 0.09;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(side * ex - r * 0.12, ey);
+      ctx.lineTo(side * ex + r * 0.12, ey);
+      ctx.stroke();
+    }
+  } else {
+    for (const side of [-1, 1]) {
+      ctx.fillStyle = '#4E342E';
+      ctx.beginPath(); ctx.arc(side * ex, ey, r * 0.12, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath(); ctx.arc(side * ex + r * 0.04, ey - r * 0.04, r * 0.045, 0, TAU); ctx.fill();
+    }
+  }
+
+  // Нос и рот
+  ctx.fillStyle = inner;
+  ctx.beginPath();
+  ctx.moveTo(-r * 0.07, -r * 0.1);
+  ctx.lineTo(r * 0.07, -r * 0.1);
+  ctx.lineTo(0, -r * 0.01);
+  ctx.closePath();
+  ctx.fill();
+  if (scaredNow) {
+    // Открытый от удивления рот «О»
+    ctx.fillStyle = '#5D4037';
+    ctx.beginPath();
+    ctx.ellipse(0, r * 0.15, r * 0.09, r * 0.12, 0, 0, TAU);
+    ctx.fill();
+  } else {
+    ctx.strokeStyle = '#5D4037';
+    ctx.lineWidth = r * 0.05;
+    ctx.beginPath();
+    ctx.arc(-r * 0.08, r * 0.05, r * 0.08, 0.1, Math.PI - 0.4);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(r * 0.08, r * 0.05, r * 0.08, 0.4, Math.PI - 0.1);
+    ctx.stroke();
+  }
+
+  // Румянец
+  ctx.fillStyle = 'rgba(255,138,101,0.45)';
+  ctx.beginPath(); ctx.ellipse(-r * 0.45, -r * 0.08, r * 0.14, r * 0.09, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(r * 0.45, -r * 0.08, r * 0.14, r * 0.09, 0, 0, TAU); ctx.fill();
+
+  // Усы
+  ctx.strokeStyle = 'rgba(93,64,55,0.75)';
+  ctx.lineWidth = r * 0.045;
+  for (const side of [-1, 1]) {
+    for (const dy of [-0.02, 0.06]) {
+      ctx.beginPath();
+      ctx.moveTo(side * r * 0.3, r * dy + r * 0.02);
+      ctx.lineTo(side * r * 0.95, r * (dy - 0.08));
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+// ---------- UI ----------
+function drawUITexts() {
+  for (const t of uiTexts) {
+    const k = t.life / t.max;
+    let tx = t.x, ty = t.y;
+    if (t.text === 'РЕКОРД!') { tx = W / 2; ty = H * 0.3; }
+    else {
+      ty = ty - cameraY;
+      ty = clamp(ty, 40, H - 40);
+    }
+    ctx.save();
+    ctx.globalAlpha = k;
+    ctx.translate(tx, ty);
+    ctx.scale(t.scale, t.scale);
+    ctx.font = 'bold ' + Math.round(24 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = 'rgba(40,40,40,0.55)';
+    ctx.lineWidth = 4;
+    ctx.strokeText(t.text, 0, 0);
+    ctx.fillStyle = t.color;
+    ctx.fillText(t.text, 0, 0);
+    ctx.restore();
+  }
+}
+
+function drawHUD() {
+  if (state !== STATE.PLAY) return;
+  const fs = Math.round(32 * Math.max(K, 0.9));
+  ctx.save();
+  ctx.textBaseline = 'middle';
+
+  ctx.font = 'bold ' + fs + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.shadowColor = 'rgba(0,0,0,0.35)';
+  ctx.shadowBlur = 6;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText(Math.floor(score), 58 * K + 12, 30 * K);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = '#FFD54F';
+  starPath(ctx, 32 * K, 30 * K, 13 * K, 0);
+  ctx.fill();
+  ctx.fillStyle = '#FFF59D';
+  starPath(ctx, 32 * K, 30 * K, 8 * K, 0);
+  ctx.fill();
+
+  ctx.font = 'bold ' + Math.round(fs * 0.55) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  ctx.fillText(starsCount + ' ★', 16, 30 * K + fs * 0.62);
+
+  for (let i = 0; i < 3; i++) {
+    const hx = W - 24 * K - i * 30 * K, hy = 30 * K;
+    if (i < lives) {
+      ctx.fillStyle = '#FF6E6E';
+      heartPath(ctx, hx, hy, 11 * K);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.beginPath(); ctx.arc(hx - 4 * K, hy - 5 * K, 2.6 * K, 0, TAU); ctx.fill();
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 2;
+      heartPath(ctx, hx, hy, 11 * K);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawComboLabel() {
+  if (combo < 2 || !player) return;
+  const mult = combo >= 3 ? 2 : 1;
+  ctx.save();
+  ctx.font = 'bold ' + Math.round(20 * K) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const col = combo >= 3 ? '#FFD700' : 'rgba(255,255,255,0.9)';
+  const pulse = combo >= 3 ? 1 + 0.12 * Math.sin(elapsed * 10) : 1;
+  ctx.translate(player.x, player.y - player.r * 2.2);
+  ctx.scale(pulse, pulse);
+  ctx.strokeStyle = 'rgba(40,40,40,0.5)';
+  ctx.lineWidth = 3;
+  ctx.strokeText('×' + mult, 0, 0);
+  ctx.fillStyle = col;
+  ctx.fillText('×' + mult, 0, 0);
+  ctx.restore();
+}
+
+function drawMuteButton() {
+  const w = Math.max(48, 54 * K), h = Math.max(48, 54 * K);
+  muteBtn = { x: W - w - 14, y: H - h - 14, w, h };
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = 'rgba(15,25,45,0.55)';
+  roundRectPath(ctx, muteBtn.x, muteBtn.y, w, h, 14 * K);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+  ctx.lineWidth = 2;
+  roundRectPath(ctx, muteBtn.x, muteBtn.y, w, h, 14 * K);
+  ctx.stroke();
+  const cx = muteBtn.x + w / 2, cy = muteBtn.y + h / 2, s = w * 0.16;
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 1.4, cy - s * 0.5);
+  ctx.lineTo(cx - s * 0.4, cy - s * 0.5);
+  ctx.lineTo(cx + s * 0.4, cy - s * 1.2);
+  ctx.lineTo(cx + s * 0.4, cy + s * 1.2);
+  ctx.lineTo(cx - s * 0.4, cy + s * 0.5);
+  ctx.lineTo(cx - s * 1.4, cy + s * 0.5);
+  ctx.closePath();
+  ctx.fill();
+  if (muted) {
+    ctx.strokeStyle = '#FF5252';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(cx - s * 0.9, cy - s * 0.9);
+    ctx.lineTo(cx + s * 0.9, cy + s * 0.9);
+    ctx.stroke();
+  } else {
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    for (const rr of [s * 0.9, s * 1.45]) {
+      ctx.beginPath();
+      ctx.arc(cx + s * 0.4, cy, rr, -Math.PI / 3.2, Math.PI / 3.2);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+// ---------- Меню ----------
+function drawMenu() {
+  const a = clamp(menuAppear, 0, 1);
+  if (a <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(0, (1 - a) * -34);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const fs = Math.round(Math.max(34, 42 * K));
+  ctx.font = 'bold ' + fs + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.strokeStyle = 'rgba(30,60,110,0.55)';
+  ctx.lineWidth = 7;
+  ctx.strokeText('КОТИК В ОБЛАКАХ', W / 2, H * 0.14);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText('КОТИК В ОБЛАКАХ', W / 2, H * 0.14);
+
+  // Котик на облаке (дышит, парит)
+  const cy = H * 0.42 + Math.sin(elapsed * 1.6) * 12 * K;
+  const spr = CLOUD_CACHE['normal_0'];
+  if (spr) {
+    const sc = 2.6 * K;
+    ctx.globalAlpha = a * 0.95;
+    ctx.drawImage(spr, W / 2 - CLOUD_SIZE * sc / 2, cy + 40 * K - CLOUD_SIZE * sc / 2,
+                  CLOUD_SIZE * sc, CLOUD_SIZE * sc);
+    ctx.globalAlpha = a;
+  }
+  drawCat(W / 2, cy, {
+    r: 34 * K, squash: 0, tilt: Math.sin(elapsed * 0.8) * 0.08,
+    blink: menuBlink, happy: 1, breath: elapsed * 2.5, vy: 0, inv: 0
+  });
+
+  if (best > 0) {
+    ctx.font = 'bold ' + Math.round(18 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.strokeStyle = 'rgba(30,60,110,0.4)';
+    ctx.lineWidth = 4;
+    const label = 'Рекорд: ' + best;
+    ctx.strokeText(label, W / 2, H * 0.58);
+    ctx.fillText(label, W / 2, H * 0.58);
+  }
+
+  const blinkA = 0.45 + 0.55 * Math.abs(Math.sin(elapsed * 2.4));
+  ctx.globalAlpha = a * blinkA;
+  ctx.font = 'bold ' + Math.round(20 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.strokeStyle = 'rgba(30,60,110,0.5)';
+  ctx.lineWidth = 5;
+  ctx.strokeText('Нажми на экран — и полетели!', W / 2, H * 0.74);
+  ctx.fillText('Нажми на экран — и полетели!', W / 2, H * 0.74);
+  ctx.restore();
+}
+
+// ---------- Экран проигрыша ----------
+function drawOver() {
+  const a = clamp(overAppear, 0, 1);
+  if (a <= 0) return;
+  const e = easeOutBack(a);
+  const pw = Math.min(W * 0.86, 340 * K);
+  const ph = Math.min(H * 0.44, 300 * K);
+  const px = W / 2 - pw / 2;
+  const py = H / 2 - ph / 2 + (1 - e) * 60;
+
+  ctx.save();
+  ctx.globalAlpha = clamp(a, 0, 1);
+
+  ctx.fillStyle = 'rgba(10,20,50,' + 0.35 * a + ')';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(0, (1 - e) * 40);
+  ctx.scale(e, e);
+  ctx.fillStyle = 'rgba(255,255,255,0.94)';
+  roundRectPath(ctx, px, py, pw, ph, 22 * K);
+  ctx.fill();
+  ctx.strokeStyle = '#C6FF00';
+  ctx.lineWidth = 3;
+  roundRectPath(ctx, px, py, pw, ph, 22 * K);
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#37474F';
+  ctx.font = 'bold ' + Math.round(24 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText('ПОЛЁТ ОКОНЧЕН', W / 2, py + ph * 0.18);
+
+  ctx.font = 'bold ' + Math.round(46 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#1565C0';
+  ctx.fillText(Math.floor(score), W / 2, py + ph * 0.4);
+
+  ctx.font = 'bold ' + Math.round(17 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillStyle = '#607D8B';
+  ctx.fillText('Звёзд: ' + starsCount + '   ·   Рекорд: ' + best, W / 2, py + ph * 0.55);
+
+  if (record) {
+    const p = 1 + 0.06 * Math.sin(gameTime * 5);
+    ctx.save();
+    ctx.translate(W / 2, py + ph * 0.68);
+    ctx.scale(p, p);
+    ctx.font = 'bold ' + Math.round(20 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = '#FFB300';
+    ctx.strokeStyle = 'rgba(120,70,0,0.4)';
+    ctx.lineWidth = 4;
+    ctx.strokeText('★ НОВЫЙ РЕКОРД! ★', 0, 0);
+    ctx.fillText('★ НОВЫЙ РЕКОРД! ★', 0, 0);
+    ctx.restore();
+  }
+
+  // Кнопка «ЕЩЁ РАЗ» — пульсирует
+  const bw = pw * 0.7, bh = 54 * Math.max(K, 0.85);
+  const bp = 1 + 0.035 * Math.sin(gameTime * 5);
+  ctx.save();
+  ctx.translate(W / 2, py + ph * 0.86);
+  ctx.scale(bp, bp);
+  ctx.fillStyle = '#C6FF00';
+  roundRectPath(ctx, -bw / 2, -bh / 2, bw, bh, bh / 2);
+  ctx.fill();
+  ctx.fillStyle = '#33691E';
+  ctx.font = 'bold ' + Math.round(20 * Math.max(K, 0.9)) + 'px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText('ЕЩЁ РАЗ', 0, 1);
+  ctx.restore();
+
+  ctx.restore(); // панель
+  ctx.restore();
+}
+
+// ---------- Главный рендер ----------
+function draw(dt) {
+  const t = clamp(score / 2600, 0, 1); // 0 = день, 1 = ночь
+
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, mixColor('#6EC6FF', '#0E1A3A', t));
+  g.addColorStop(1, mixColor('#D8F1FF', '#2A3B66', t));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // Закатная полоса у горизонта
+  const sunK = Math.sin(clamp((t - 0.15) / 0.7, 0, 1) * Math.PI);
+  if (sunK > 0.02) {
+    const sg = ctx.createLinearGradient(0, H * 0.45, 0, H);
+    sg.addColorStop(0, 'rgba(255,140,90,0)');
+    sg.addColorStop(0.55, 'rgba(255,138,101,' + 0.28 * sunK + ')');
+    sg.addColorStop(1, 'rgba(244,143,177,' + 0.38 * sunK + ')');
+    ctx.fillStyle = sg;
+    ctx.fillRect(0, H * 0.45, W, H * 0.55);
+  }
+
+  ctx.save();
+  const z = 1 + zoomPulse * 0.03;
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(z, z);
+  ctx.translate(-W / 2, -H / 2);
+  if (shake > 0.05) ctx.translate(Math.round(rand(-1, 1) * 8 * shake),
+                                  Math.round(rand(-1, 1) * 8 * shake));
+
+  drawCelestials(t);
+  drawAurora(clamp((t - 0.55) * 2, 0, 1));
+  drawBgLayers(t);
+  drawDust(t);
+
+  ctx.save();
+  ctx.translate(0, -cameraY);
+  for (const p of platforms) drawCloudPlatform(p);
+  for (const s of stars) if (!s.taken) drawStarItem(s);
+  for (const b of birds) drawBird(b);
+  drawParticles();
+
+  if (state === STATE.MENU) {
+    const cy = H * 0.42 + Math.sin(elapsed * 1.6) * 12 * K;
+    drawCat(W / 2, cy, {
+      r: 34 * K, squash: 0, tilt: Math.sin(elapsed * 0.8) * 0.08,
+      blink: menuBlink, happy: 1, breath: elapsed * 2.5, vy: 0, inv: 0
+    });
+  } else if (player) {
+    drawCat(player.x, player.y, {
+      r: player.r, squash: player.squash, tilt: player.tilt,
+      blink: player.blink, happy: player.happy, breath: player.breath,
+      vy: player.vy, inv: player.inv, tailPh: elapsed * 3
+    });
+    drawComboLabel();
+  }
+  ctx.restore(); // камера
+
+  drawUITexts();
+  drawHUD();
+  drawMuteButton();
+  ctx.restore(); // shake/zoom
+
+  drawVignette();
+
+  if (flash > 0) {
+    ctx.fillStyle = 'rgba(255,255,255,' + flash * 0.7 + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (state === STATE.MENU) drawMenu();
+  if (state === STATE.OVER) drawOver();
+}
+
+// ---------- ЗАПУСК ----------
+resize();
+initParallax();
+buildCloudCache();
+requestAnimationFrame(loop);
+
+})();
+
+</script>
+</body>
+</html>
